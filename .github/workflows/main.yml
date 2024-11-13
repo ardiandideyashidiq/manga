@@ -1,46 +1,78 @@
-task:
-  name: Manga Downloader
-  container:
-    image: ubuntu:latest
-  env:
-    PIXELDRAIN_API: ${PIXELDRAIN_API}  # Set your secret here
-    TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}    # Set your secret here
-    TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID} # Set your secret here
+name: Manga Downloader
 
-  steps:
-    - install:
-        packages:
-          - python3-pip
+on:
+  workflow_dispatch:
+    inputs:
+      single_index:
+        description: 'Single index to process (e.g., 5)'
+        required: false
+        type: string
+      index_range:
+        description: 'Index range to process (e.g., 3-13)'
+        required: false
+        type: string
+      custom_url:
+        description: 'Custom URL to process (optional)'
+        required: false
+        type: string
 
-    - script: |
-        echo "start_time=$(date +%s)" >> $CIRRUS_ENV
-        
-    - script: |
-        pip install mangadex-downloader
+permissions:
+  contents: write
 
-    - script: |
-        if [[ -n "${CIRRUS_ENV_CUSTOM_URL}" ]]; then
-          echo "use_custom_url=true" >> $CIRRUS_OUTPUT
-          echo "custom_url=${CIRRUS_ENV_CUSTOM_URL}" >> $CIRRUS_OUTPUT
-          echo "start_index=1" >> $CIRRUS_OUTPUT
-          echo "end_index=1" >> $CIRRUS_OUTPUT
-        elif [[ -n "${CIRRUS_ENV_SINGLE_INDEX}" ]]; then
-          echo "is_range=false" >> $CIRRUS_OUTPUT
-          echo "start_index=${CIRRUS_ENV_SINGLE_INDEX}" >> $CIRRUS_OUTPUT
-          echo "end_index=${CIRRUS_ENV_SINGLE_INDEX}" >> $CIRRUS_OUTPUT
-        elif [[ -n "${CIRRUS_ENV_INDEX_RANGE}" ]]; then
-          echo "is_range=true" >> $CIRRUS_OUTPUT
-          IFS='-' read -ra RANGE <<< "${CIRRUS_ENV_INDEX_RANGE}"
-          echo "start_index=${RANGE[0]}" >> $CIRRUS_OUTPUT
-          echo "end_index=${RANGE[1]}" >> $CIRRUS_OUTPUT
-        else
-          echo "is_range=false" >> $CIRRUS_OUTPUT
-          echo "start_index=1" >> $CIRRUS_OUTPUT
-          echo "end_index=1" >> $CIRRUS_OUTPUT
-        fi
+jobs:
+  process_manga:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.single_index != '' || github.event.inputs.index_range != '' || github.event.inputs.custom_url != '' }}
 
-    - script: |
-        process_url() {
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Get start time
+        run: echo "start_time=$(date +%s)" >> $GITHUB_ENV           
+
+      - name: Install dependencies
+        run: |
+          pip install mangadex-downloader
+
+      - name: Determine Indices and URL
+        id: determine_indices
+        run: |
+          if [[ -n "${{ github.event.inputs.custom_url }}" ]]; then
+            echo "use_custom_url=true" >> $GITHUB_OUTPUT
+            echo "custom_url=${{ github.event.inputs.custom_url }}" >> $GITHUB_OUTPUT
+            echo "start_index=1" >> $GITHUB_OUTPUT
+            echo "end_index=1" >> $GITHUB_OUTPUT
+          elif [[ -n "${{ github.event.inputs.single_index }}" ]]; then
+            echo "is_range=false" >> $GITHUB_OUTPUT
+            echo "start_index=${{ github.event.inputs.single_index }}" >> $GITHUB_OUTPUT
+            echo "end_index=${{ github.event.inputs.single_index }}" >> $GITHUB_OUTPUT
+          elif [[ -n "${{ github.event.inputs.index_range }}" ]]; then
+            echo "is_range=true" >> $GITHUB_OUTPUT
+            IFS='-' read -ra RANGE <<< "${{ github.event.inputs.index_range }}"
+            echo "start_index=${RANGE[0]}" >> $GITHUB_OUTPUT
+            echo "end_index=${RANGE[1]}" >> $GITHUB_OUTPUT
+          else
+            echo "is_range=false" >> $GITHUB_OUTPUT
+            echo "start_index=1" >> $GITHUB_OUTPUT
+            echo "end_index=1" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Use slimhub_actions for range processing
+        if: steps.determine_indices.outputs.is_range == 'true'
+        uses: rokibhasansagar/slimhub_actions@main   
+                  
+      - name: Process Manga
+        id: process_manga
+        env:
+          PIXELDRAIN_API: ${{ secrets.PIXELDRAIN_API }}
+        run: |
+          start_index=${{ steps.determine_indices.outputs.start_index }}
+          end_index=${{ steps.determine_indices.outputs.end_index }}
+          use_custom_url=${{ steps.determine_indices.outputs.use_custom_url }}
+          custom_url=${{ steps.determine_indices.outputs.custom_url }}
+          
+          process_url() {
             local url="$1"
             local index="$2"
             echo "Processing manga from URL: $url"
@@ -49,15 +81,14 @@ task:
             manga_folder=$(ls manga)
             if [ -z "$manga_folder" ]; then
               echo "Error: No manga folder found for $url"
-              return 1
+              return
             fi
-            
             sanitized_folder_name=$(echo "${manga_folder}" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
             
             echo "Archiving folder '${manga_folder}' to '${sanitized_folder_name}.tar'"
             if ! tar -cf "${sanitized_folder_name}.tar" -C manga "${manga_folder}"; then
               echo "Error: Failed to create archive for $url"
-              return 1
+              return
             fi
             
             size=$(du -h "${sanitized_folder_name}.tar" | cut -f1)
@@ -71,28 +102,88 @@ task:
             fi
             
             rm -rf manga "${sanitized_folder_name}.tar"
-        }
+          }
+          
+          if [ "$use_custom_url" = "true" ]; then
+            process_url "$custom_url" "custom"
+          else
+            for ((i=start_index; i<=end_index; i++)); do
+              url=$(sed -n "${i}p" manga.txt)
+              if [[ -z "$url" ]]; then
+                echo "No URL found at line ${i}. Stopping."
+                break
+              fi
+              process_url "$url" "$i"
+            done
+          fi
+          
+          if [ ! -f upload_info.txt ]; then
+            echo "workflow_complete=true" >> $GITHUB_OUTPUT
+          fi
 
-        if [[ "$use_custom_url" == "true" ]]; then
-          process_url "$custom_url" "custom"
-        else
-          for ((i=start_index; i<=end_index; i++)); do
-            url=$(sed -n "${i}p" manga.txt)
-            if [[ -z "$url" ]]; then
-              echo "No URL found at line ${i}. Stopping."
-              break
+      - name: Calculate duration
+        if: always()
+        run: |
+          end_time=$(date +%s)
+          duration=$((end_time - ${{ env.start_time }}))
+          echo "workflow_duration=$duration" >> $GITHUB_ENV
+
+      - name: Send Telegram Notification
+        if: always()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          status="${{ job.status }}"
+          duration="${{ env.workflow_duration }}"
+          
+          # Convert duration to a more readable format
+          hours=$((duration / 3600))
+          minutes=$(( (duration % 3600) / 60 ))
+          seconds=$((duration % 60))
+          
+          # Determine which input was used
+          if [ -n "${{ github.event.inputs.single_index }}" ]; then
+            input_used="Single index: ${{ github.event.inputs.single_index }}"
+          elif [ -n "${{ github.event.inputs.index_range }}" ]; then
+            input_used="Index range: ${{ github.event.inputs.index_range }}"
+          elif [ -n "${{ github.event.inputs.custom_url }}" ]; then
+            input_used="Custom URL: ${{ github.event.inputs.custom_url }}"
+          else
+            input_used="No input provided"
+          fi
+          
+          if [ "$status" = "success" ]; then
+            message="✅ Manga Upload Successful!\n\n"
+            message+="Workflow duration: ${hours}h ${minutes}m ${seconds}s\n\n"
+            message+="Input: ${input_used}\n\n"
+            message+="-----\n\n"
+            while IFS='|' read -r title filename index size link1 link2; do
+              message+="Title: ${title}\n"
+              message+="File: ${filename}\n"
+              message+="Index: ${index}\n"
+              message+="Size: ${size}\n"
+              message+="Link1: ${link1}\n"
+              message+="Link2: ${link2}\n\n"
+              message+="-----\n\n"
+            done < upload_info.txt
+          else
+            message="❌ Workflow Failed!\n\n"
+            message+="Workflow duration: ${hours}h ${minutes}m ${seconds}s\n\n"
+            message+="Input: ${input_used}\n\n"
+            
+            # Check if failure is due to no space left
+            if grep -q "no space left on device" <<< "${{ job.status }}"; then
+              message+="Error: No space left on device\n\n"
+              message+="Disk usage:\n"
+              message+="$(du -sh -- * | sort -rh)\n\n"
+            else
+              message+="Please check the workflow logs for more information.\n\n"
             fi
-            process_url "$url" "$i"
-          done
-        fi
-        
-        if [ ! -f upload_info.txt ]; then
-          echo "workflow_complete=true" >> $CIRRUS_OUTPUT 
-        fi
-
-    - script: |
-        end_time=$(date +%s)
-        duration=$((end_time - $(cat $CIRRUS_ENV/start_time)))
-        echo "workflow_duration=$duration" >> $CIRRUS_ENV
-        
-    # Send Telegram Notification step would go here, similar to above.
+          fi
+          
+          message+="Workflow finished at $(TZ='Asia/Jakarta' date '+%d-%m-%Y %H:%M:%S %Z')"
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+               -H "Content-Type: application/json" \
+               -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${message}\", \"parse_mode\": \"HTML\"}"
