@@ -76,7 +76,7 @@ jobs:
             local url="$1"
             local index="$2"
             echo "Processing manga from URL: $url"
-            mangadex-dl "$url" --no-group-name -d manga --progress-bar-layout=none -wti
+            mangadex-dl "$url" --no-group-name -d manga --progress-bar-layout=none -wti -f cbz
             
             manga_folder=$(ls manga)
             if [ -z "$manga_folder" ]; then
